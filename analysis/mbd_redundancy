@@ -1,0 +1,121 @@
+import pandas as pd
+import numpy as np
+import itertools
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score
+
+train_csv_path = "/content/drive/MyDrive/num_train.csv"
+test_csv_path = "/content/drive/MyDrive/num_test.csv"
+
+def load_and_transform(csv_path):
+    df = pd.read_csv(csv_path, header=None)
+    df = df.iloc[1:, 1:]
+    data = df.values.astype(float)
+    num_samples = data.shape[0]
+    output = []
+    for i in range(num_samples):
+        matrix_14x256 = data[i].reshape(14, 256)
+        fft_matrix = np.fft.rfft(matrix_14x256, axis=1)
+        power_spectrum = np.abs(fft_matrix) ** 2
+        power_spectrum = power_spectrum[:, :128]
+        output.append(power_spectrum)
+    return np.array(output)
+
+print("Loading & transforming training data...")
+train_power = load_and_transform(train_csv_path)
+print("Loading & transforming test data...")
+test_power = load_and_transform(test_csv_path)
+print("train_power shape:", train_power.shape)
+print("test_power shape:", test_power.shape)
+
+y_train = np.array([1] * 120 + [0] * 120)
+y_test = np.array([1] * 30 + [0] * 30)
+
+if train_power.shape[0] != 240:
+    raise ValueError(f"Expected 240 training samples, got {train_power.shape[0]}")
+if test_power.shape[0] != 60:
+    raise ValueError(f"Expected 60 test samples, got {test_power.shape[0]}")
+
+def get_features_for_pair(X_power, pair, method='separate'):
+    r1, r2 = pair
+    r1 -= 1
+    r2 -= 1
+    row1 = X_power[:, r1, :]
+    row2 = X_power[:, r2, :]
+    if method == 'separate':
+        return np.concatenate([row1, row2], axis=1)
+    elif method == 'average':
+        return (row1 + row2) / 2.0
+    else:
+        raise ValueError("method must be 'separate' or 'average'")
+
+def compute_sep_avg_ratio(pair, train_power, test_power, y_train, y_test):
+    X_train_sep = get_features_for_pair(train_power, pair, method='separate')
+    X_test_sep = get_features_for_pair(test_power, pair, method='separate')
+    X_train_avg = get_features_for_pair(train_power, pair, method='average')
+    X_test_avg = get_features_for_pair(test_power, pair, method='average')
+    scaler_sep = StandardScaler()
+    X_train_sep_scaled = scaler_sep.fit_transform(X_train_sep)
+    X_test_sep_scaled = scaler_sep.transform(X_test_sep)
+    scaler_avg = StandardScaler()
+    X_train_avg_scaled = scaler_avg.fit_transform(X_train_avg)
+    X_test_avg_scaled = scaler_avg.transform(X_test_avg)
+    lr_sep = LogisticRegression(max_iter=1000)
+    lr_sep.fit(X_train_sep_scaled, y_train)
+    acc_sep = accuracy_score(y_test, lr_sep.predict(X_test_sep_scaled))
+    lr_avg = LogisticRegression(max_iter=1000)
+    lr_avg.fit(X_train_avg_scaled, y_train)
+    acc_avg = accuracy_score(y_test, lr_avg.predict(X_test_avg_scaled))
+    if acc_sep == 0:
+        return 0.0
+    ratio = (acc_sep - acc_avg) / acc_sep
+    return ratio
+
+all_pairs = list(itertools.combinations(range(1, 15), 2))
+treatment_pairs = [(6, 7), (8, 9)]
+print("\nComputing ratio ( (sep - avg)/sep ) for each of the 91 pairs...")
+pair_ratios = {}
+for pair in tqdm(all_pairs):
+    ratio_val = compute_sep_avg_ratio(pair, train_power, test_power, y_train, y_test)
+    pair_ratios[pair] = ratio_val
+treatment_ratios = [pair_ratios[p] for p in treatment_pairs]
+control_ratios = [pair_ratios[p] for p in all_pairs if p not in treatment_pairs]
+
+obs_treatment_mean = np.mean(treatment_ratios)
+obs_control_mean = np.mean(control_ratios)
+observed_diff = obs_treatment_mean - obs_control_mean
+print("\nTreatment pairs:")
+for tp in treatment_pairs:
+    print(f"  {tp} => ratio = {pair_ratios[tp]:.4f}")
+print(f"Mean treatment ratio: {obs_treatment_mean:.4f}")
+print(f"Mean control ratio:   {obs_control_mean:.4f}")
+print(f"Observed difference (treatment-control) = {observed_diff:.4f}")
+
+all_combos_of_2 = list(itertools.combinations(all_pairs, 2))
+null_diffs = []
+print(f"\nExhaustive permutation test: enumerating {len(all_combos_of_2)} ways to pick 2 'treatment' pairs...")
+for combo in tqdm(all_combos_of_2):
+    combo_treatment_ratios = [pair_ratios[p] for p in combo]
+    set_treatment = set(combo)
+    combo_control_ratios = [pair_ratios[p] for p in all_pairs if p not in set_treatment]
+    perm_diff = np.mean(combo_treatment_ratios) - np.mean(combo_control_ratios)
+    null_diffs.append(perm_diff)
+null_diffs = np.array(null_diffs)
+p_value = np.mean(null_diffs <= observed_diff)
+
+print(f"\nObserved difference in means (treatment - control) = {observed_diff:.4f}")
+print(f"Mean of null distribution = {null_diffs.mean():.4f}")
+print(f"p-value (one-sided, lower=better) = {p_value:.4f}")
+
+plt.figure(figsize=(8, 5))
+plt.hist(null_diffs, bins=30, alpha=0.7)
+plt.axvline(observed_diff, color='red', linestyle='--', label=f"Observed diff = {observed_diff:.4f}")
+plt.xlabel("Difference in Means (treatment - control), permuted")
+plt.ylabel("Count")
+plt.title("Exhaustive Permutation Test Null Distribution\n( (sep - avg)/sep )")
+plt.legend()
+plt.tight_layout()
+plt.show()
